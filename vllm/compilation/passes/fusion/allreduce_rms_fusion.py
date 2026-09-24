@@ -1798,9 +1798,6 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
                 ),
                 self.quant_pm_pass,
             )
-                    self.device,
-                )
-            )
 
             self.register(
                 AiterAllreduceFusedRMSNormPattern(
