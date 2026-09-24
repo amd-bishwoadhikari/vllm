@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
+    VLLM_ROCM_USE_AITER_FUSED_ROUTER: bool = False
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_SITUV2: bool = False
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
@@ -154,6 +155,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+    VLLM_ROCM_MINIMAX_INDEXER_CP: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_PLE_CPU_OFFLOAD: bool = True
@@ -1275,6 +1277,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         or os.getenv("VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4", "0").lower()
         in ("true", "1")
     ),
+    # Whether to run MoE routing (top-k selection, expert sort and MXFP4
+    # activation quant) inside the AITER expert kernel instead of as four
+    # kernels before it. Opt-in: needs gfx950, MXFP4 experts and an AITER
+    # build carrying module_fused_moe_routing.
+    "VLLM_ROCM_USE_AITER_FUSED_ROUTER": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FUSED_ROUTER", "False").lower() in ("true", "1")
+    ),
     # MoE sorting dispatch policy for AITER fused MoE kernels.
     #   0 = auto (default): single-pass for small batches, multi-pass
     #       for large batches
@@ -1361,6 +1370,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+    ),
+    # Whether to use Context-Parallel AITER FP8 Sparse Indexer for MiniMax-M3
+    "VLLM_ROCM_MINIMAX_INDEXER_CP": lambda: (
+        os.getenv("VLLM_ROCM_MINIMAX_INDEXER_CP", "False").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
