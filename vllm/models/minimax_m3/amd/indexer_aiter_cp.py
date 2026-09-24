@@ -47,10 +47,10 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
         decode_page16_block_table: torch.Tensor | None = None,
         prefill_page16_block_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        from vllm._aiter_ops import rocm_aiter_ops
-
-        pa_sparse_block_score_decode = rocm_aiter_ops.pa_sparse_block_score_decode
-        pa_sparse_block_topk = rocm_aiter_ops.pa_sparse_block_topk
+        from aiter.ops.msa_attention import (
+            pa_sparse_block_score_decode,
+            pa_sparse_block_topk,
+        )
 
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
