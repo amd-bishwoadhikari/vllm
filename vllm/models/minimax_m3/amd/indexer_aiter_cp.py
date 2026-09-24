@@ -106,6 +106,7 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
 
             # Score owned blocks.
             shard_score = self._new_score(nd, shard_max_seq_len)
+            shard_score.fill_(float("-inf"))
             pa_sparse_block_score_decode(
                 iq[:nd],
                 kv,
@@ -118,8 +119,10 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
                 max_seq_len=shard_max_seq_len,
             )
             # Scatter per-block scores into global tensor at owned column positions.
-            n_cols = min(local_blocks, shard_score.shape[-1])
-            score[..., owned_cols[:n_cols]] = shard_score[..., :n_cols]
+            seq_blocks = (d.max_seq_len + self.block_size - 1) // self.block_size
+            num_owned = (seq_blocks - rank + (world_size - 1)) // world_size if seq_blocks > rank else 0
+            if num_owned > 0:
+                score[..., owned_cols[:num_owned]] = shard_score[..., :num_owned]
 
             # MAX allreduce reconstructs full global scores.
             dist.all_reduce(
