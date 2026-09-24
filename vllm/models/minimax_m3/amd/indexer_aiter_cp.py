@@ -88,33 +88,38 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
             # Round-robin shard: rank r owns global blocks r, r+W, r+2W, ...
             owned_cols = torch.arange(
                 rank, max_blocks, world_size,
-                dtype=d.block_table.dtype,
+                dtype=torch.long,
                 device=d.block_table.device,
             )
-            shard_bt = d.block_table[:, owned_cols]
+            shard_bt = d.block_table[:, owned_cols].contiguous()
+            local_blocks = shard_bt.shape[1]
+            shard_max_seq_len = max(local_blocks * self.block_size, 1)
+
+            # Compute sequence length for the shard to prevent kernel from indexing past shard_bt
+            n_blocks = (d.seq_lens + self.block_size - 1) // self.block_size
+            n_owned = torch.clamp((n_blocks - rank + (world_size - 1)) // world_size, min=0, max=local_blocks)
+            shard_seq_lens = (n_owned * self.block_size).to(dtype=d.seq_lens.dtype)
 
             # Allocate global score tensor pre-filled with -inf.
             score = self._new_score(nd, d.max_seq_len)
             score.fill_(float("-inf"))
 
-            # Score owned blocks. shard_score uses d.max_seq_len so its
-            # block-axis width (score_block_width) matches the global score,
-            # making owned_cols column indices directly valid for both tensors.
-            shard_score = self._new_score(nd, d.max_seq_len)
+            # Score owned blocks.
+            shard_score = self._new_score(nd, shard_max_seq_len)
             pa_sparse_block_score_decode(
                 iq[:nd],
                 kv,
                 shard_score,
                 shard_bt,
-                d.seq_lens,
+                shard_seq_lens,
                 init_blocks=self.init_blocks,
                 local_blocks=self.local_blocks,
                 query_len=d.decode_query_len,
-                max_seq_len=d.max_seq_len,
+                max_seq_len=shard_max_seq_len,
             )
             # Scatter per-block scores into global tensor at owned column positions.
-            n_owned = min(len(owned_cols), shard_score.shape[-1])
-            score[..., owned_cols[:n_owned]] = shard_score[..., :n_owned]
+            n_cols = min(local_blocks, shard_score.shape[-1])
+            score[..., owned_cols[:n_cols]] = shard_score[..., :n_cols]
 
             # MAX allreduce reconstructs full global scores.
             dist.all_reduce(
