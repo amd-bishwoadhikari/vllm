@@ -49,6 +49,7 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         from aiter.ops.msa_attention import (
             pa_sparse_block_score_decode,
+            pa_sparse_block_score_prefill,
             pa_sparse_block_topk,
         )
 
@@ -148,10 +149,44 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
             )
 
         if md.num_prefills > 0:
-            _, prefill_topk = super().forward(
-                index_query,
-                decode_page16_block_table=None,
-                prefill_page16_block_table=prefill_page16_block_table,
+            assert prefill_page16_block_table is not None, (
+                "the AITER indexer's top-k emits the attend's page table and "
+                "needs the page-16 rebase of the attend's prefill block table"
+            )
+            assert md.prefill_num_valid_pages is not None
+            assert md.prefill_row_req_id is not None
+            assert md.prefill_kv_lens is not None
+            p = md.prefill
+            assert p is not None
+            score = self._new_score(num_tokens - nd, p.max_seq_len)
+            pa_sparse_block_score_prefill(
+                iq[nd:],
+                kv,
+                score,
+                p.block_table,
+                p.cu_seqlens_q,
+                p.seq_lens,
+                init_blocks=self.init_blocks,
+                local_blocks=self.local_blocks,
+                max_query_len=p.max_query_len,
+                max_seq_len=p.max_seq_len,
+            )
+            prefill_topk = buf[:, nd:num_tokens, :]
+            sparse_bt, sparse_ctx = self._table_rows(nd, num_tokens)
+            pa_sparse_block_topk(
+                score,
+                prefill_topk,
+                prefill_page16_block_table,
+                p.seq_lens,
+                sparse_bt,
+                sparse_ctx,
+                max_seq_len=p.max_seq_len,
+                block_size=self.block_size,
+                num_valid_pages=md.prefill_num_valid_pages,
+                row_req_id=md.prefill_row_req_id,
+                kv_lens=md.prefill_kv_lens,
+                num_kv_heads=self.num_kv_heads,
+                pages_per_block=self.pages_per_block,
             )
 
         return decode_topk, prefill_topk
