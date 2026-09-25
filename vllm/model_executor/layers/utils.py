@@ -322,7 +322,14 @@ def use_aiter_decode_gemm(n, m, k, dtype, bias):
         cfg = get_GEMM_A16W16_config(n, m, k, bias is not None, str(dtype), str(dtype))
     except Exception:  # aiter absent, or no configs for this arch
         return False
-    return cfg is not None and cfg.get("libtype") == "flydsl_decode"
+    if cfg is None:
+        return False
+    libtype = cfg.get("libtype")
+    if libtype in ("flydsl", "flydsl_decode", "triton", "opus"):
+        return True
+    if libtype == "asm" and cfg.get("kernelName"):
+        return True
+    return False
 
 
 def rocm_unquantized_gemm_impl(
