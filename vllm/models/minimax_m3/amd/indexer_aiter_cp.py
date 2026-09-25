@@ -47,10 +47,11 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
         decode_page16_block_table: torch.Tensor | None = None,
         prefill_page16_block_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        from vllm._aiter_ops import rocm_aiter_ops
-
-        pa_sparse_block_score_decode = rocm_aiter_ops.pa_sparse_block_score_decode
-        pa_sparse_block_topk = rocm_aiter_ops.pa_sparse_block_topk
+        from aiter.ops.msa_attention import (
+            pa_sparse_block_score_decode,
+            pa_sparse_block_score_prefill,
+            pa_sparse_block_topk,
+        )
 
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
@@ -85,49 +86,44 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
             rank = get_tp_group().rank_in_group
 
             max_blocks = d.block_table.shape[1]
-
-            # During cudagraph capture or when this rank owns no blocks
-            # (short sequences where rank >= max_blocks), fall through to
-            # the base AITER impl which handles these cases correctly.
-            if (torch.compiler.is_compiling()
-                    or max_blocks == 0
-                    or rank >= max_blocks):
-                return super().forward(
-                    index_query,
-                    decode_page16_block_table=decode_page16_block_table,
-                    prefill_page16_block_table=prefill_page16_block_table,
-                )
-
             # Round-robin shard: rank r owns global blocks r, r+W, r+2W, ...
             owned_cols = torch.arange(
                 rank, max_blocks, world_size,
-                dtype=d.block_table.dtype,
+                dtype=torch.long,
                 device=d.block_table.device,
             )
-            shard_bt = d.block_table[:, owned_cols]
+            shard_bt = d.block_table[:, owned_cols].contiguous()
+            local_blocks = shard_bt.shape[1]
+            shard_max_seq_len = max(local_blocks * self.block_size, 1)
+
+            # Compute sequence length for the shard to prevent kernel from indexing past shard_bt
+            n_blocks = (d.seq_lens + self.block_size - 1) // self.block_size
+            n_owned = torch.clamp((n_blocks - rank + (world_size - 1)) // world_size, min=0, max=local_blocks)
+            shard_seq_lens = (n_owned * self.block_size).to(dtype=d.seq_lens.dtype)
 
             # Allocate global score tensor pre-filled with -inf.
             score = self._new_score(nd, d.max_seq_len)
             score.fill_(float("-inf"))
 
-            # Score owned blocks. shard_score uses d.max_seq_len so its
-            # block-axis width (score_block_width) matches the global score,
-            # making owned_cols column indices directly valid for both tensors.
-            shard_score = self._new_score(nd, d.max_seq_len)
+            # Score owned blocks.
+            shard_score = self._new_score(nd, shard_max_seq_len)
+            shard_score.fill_(float("-inf"))
             pa_sparse_block_score_decode(
                 iq[:nd],
                 kv,
                 shard_score,
                 shard_bt,
-                d.seq_lens,
+                shard_seq_lens,
                 init_blocks=self.init_blocks,
                 local_blocks=self.local_blocks,
                 query_len=d.decode_query_len,
-                max_seq_len=d.max_seq_len,
+                max_seq_len=shard_max_seq_len,
             )
             # Scatter per-block scores into global tensor at owned column positions.
-            n_owned = min(len(owned_cols), shard_score.shape[-1])
-            score[..., owned_cols[:n_owned]] = shard_score[..., :n_owned]
+            seq_blocks = (d.max_seq_len + self.block_size - 1) // self.block_size
+            num_owned = (seq_blocks - rank + (world_size - 1)) // world_size if seq_blocks > rank else 0
+            if num_owned > 0:
+                score[..., owned_cols[:num_owned]] = shard_score[..., :num_owned]
 
             # MAX allreduce reconstructs full global scores.
             dist.all_reduce(
@@ -153,10 +149,44 @@ class MiniMaxM3IndexerAiterCPImpl(MiniMaxM3IndexerAiterImpl):
             )
 
         if md.num_prefills > 0:
-            _, prefill_topk = super().forward(
-                index_query,
-                decode_page16_block_table=None,
-                prefill_page16_block_table=prefill_page16_block_table,
+            assert prefill_page16_block_table is not None, (
+                "the AITER indexer's top-k emits the attend's page table and "
+                "needs the page-16 rebase of the attend's prefill block table"
+            )
+            assert md.prefill_num_valid_pages is not None
+            assert md.prefill_row_req_id is not None
+            assert md.prefill_kv_lens is not None
+            p = md.prefill
+            assert p is not None
+            score = self._new_score(num_tokens - nd, p.max_seq_len)
+            pa_sparse_block_score_prefill(
+                iq[nd:],
+                kv,
+                score,
+                p.block_table,
+                p.cu_seqlens_q,
+                p.seq_lens,
+                init_blocks=self.init_blocks,
+                local_blocks=self.local_blocks,
+                max_query_len=p.max_query_len,
+                max_seq_len=p.max_seq_len,
+            )
+            prefill_topk = buf[:, nd:num_tokens, :]
+            sparse_bt, sparse_ctx = self._table_rows(nd, num_tokens)
+            pa_sparse_block_topk(
+                score,
+                prefill_topk,
+                prefill_page16_block_table,
+                p.seq_lens,
+                sparse_bt,
+                sparse_ctx,
+                max_seq_len=p.max_seq_len,
+                block_size=self.block_size,
+                num_valid_pages=md.prefill_num_valid_pages,
+                row_req_id=md.prefill_row_req_id,
+                kv_lens=md.prefill_kv_lens,
+                num_kv_heads=self.num_kv_heads,
+                pages_per_block=self.pages_per_block,
             )
 
         return decode_topk, prefill_topk
