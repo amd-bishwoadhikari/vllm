@@ -15,9 +15,6 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.attention_warmup import (
-    mixed_batch_attention_warmup,
-)
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
@@ -33,6 +30,9 @@ from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
 )
 from vllm.model_executor.warmup.mamba_triton_warmup import mamba_triton_warmup
+from vllm.model_executor.warmup.minimax_vl_triton_warmup import (
+    minimax_vl_triton_warmup,
+)
 from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (
     qwen4_exp_qsa_triton_warmup,
 )
@@ -106,16 +106,19 @@ def _warmup_bf16x3_router_gemm(
     model: torch.nn.Module,
     max_num_tokens: int,
 ) -> None:
-    from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_cutedsl import (  # noqa: E501
-        warmup_bf16x3_router_gemm,
-    )
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
+    is_rocm = current_platform.is_rocm()
     gate = next(
         (
             module
             for module in model.modules()
-            if isinstance(module, GateLinear) and module.allow_bf16x3_router_gemm
+            if isinstance(module, GateLinear)
+            and (
+                getattr(module, "allow_rocm_bf16x3_router_gemm", False)
+                if is_rocm
+                else module.allow_bf16x3_router_gemm
+            )
         ),
         None,
     )
@@ -131,13 +134,30 @@ def _warmup_bf16x3_router_gemm(
         gate.input_size,
         gate.output_size,
     )
-    configs = warmup_bf16x3_router_gemm(
-        gate.input_size,
-        gate.output_size,
-        min_num_tokens,
-        max_num_tokens,
-    )
-    logger.info_once("Warmed up BF16x3 router GEMM configs: %s.", configs)
+    if is_rocm:
+        from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_rocm import (
+            warmup_bf16x3_router_gemm,
+        )
+
+        warmup_bf16x3_router_gemm(
+            gate.input_size,
+            gate.output_size,
+            min_num_tokens,
+            max_num_tokens,
+        )
+        logger.info_once("Warmed up ROCm BF16x3 router GEMM.")
+    else:
+        from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_cutedsl import (  # noqa: E501
+            warmup_bf16x3_router_gemm,
+        )
+
+        configs = warmup_bf16x3_router_gemm(
+            gate.input_size,
+            gate.output_size,
+            min_num_tokens,
+            max_num_tokens,
+        )
+        logger.info_once("Warmed up BF16x3 router GEMM configs: %s.", configs)
 
 
 def _warmup_gemm_rs_ar() -> None:
@@ -193,6 +213,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
     qwen_vl_triton_warmup(worker.model_runner)
+    minimax_vl_triton_warmup(worker.model_runner, worker.get_model())
     mamba_triton_warmup(worker.model_runner)
 
     compilation_config = worker.vllm_config.compilation_config
@@ -204,7 +225,9 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         watermark_sample_warmup(worker)
         qwen4_exp_qsa_triton_warmup(worker)
 
-    if enable_jit_warmup and current_platform.is_device_capability_family(100):
+    if enable_jit_warmup and (
+        current_platform.is_device_capability_family(100) or current_platform.is_rocm()
+    ):
         _warmup_bf16x3_router_gemm(
             worker.get_model(),
             worker.scheduler_config.max_num_batched_tokens,
@@ -289,7 +312,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         )
     ):
         logger.info_once("Warming up FlashInfer attention.")
-        mixed_batch_attention_warmup(worker)
+        worker.model_runner._dummy_run(
+            num_tokens=16,
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+            create_mixed_batch=True,
+        )
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:

@@ -26,6 +26,7 @@ __all__ = [
     "is_supported",
     "platform_supported",
     "split_bf16x3",
+    "warmup_bf16x3_router_gemm",
 ]
 
 BF16X3_TERMS = 3
@@ -161,3 +162,27 @@ def bf16x3_router_gemm(
         num_warps=4,
     )
     return out
+
+
+def warmup_bf16x3_router_gemm(
+    input_size: int,
+    output_size: int,
+    min_num_tokens: int = MIN_TOKENS,
+    max_num_tokens: int = 32768,
+) -> None:
+    """Precompile the Triton reduction kernel for ROCm bf16x3 router GEMM."""
+    if not platform_supported():
+        return
+    device = torch.device(current_platform.device_type)
+    dummy_w = torch.empty(
+        (BF16X3_TERMS, output_size, input_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    # Exercise both divisible-by-16 and non-divisible token counts to pre-warm
+    # both Triton specialization paths for the M dimension in _reduce_terms_kernel.
+    for m in (max(min_num_tokens, MIN_TOKENS), max(min_num_tokens, MIN_TOKENS) + 1):
+        dummy_x = torch.empty((m, input_size), dtype=torch.bfloat16, device=device)
+        bf16x3_router_gemm(dummy_x, dummy_w)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
