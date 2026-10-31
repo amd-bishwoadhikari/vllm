@@ -20,7 +20,25 @@ HIDDEN = 6144
 HEAD_DIM = 128
 ROTARY_DIM = 64
 
-TP = int(os.environ.get("VLLM_MONO_TP", "2"))
+
+def _serving_tp() -> int:
+    """VLLM_MONO_TP when set, else the TP of the engine being built.
+
+    This module is first imported while the model is built, inside the engine's
+    config context, so the TP read here is the one being served; one build then
+    serves TP2, TP4 and TP8. Outside a config context (e.g. a standalone kernel
+    test) it falls back to 2.
+    """
+    env = os.environ.get("VLLM_MONO_TP")
+    if env:
+        return int(env)
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    return config.parallel_config.tensor_parallel_size if config else 2
+
+
+TP = _serving_tp()
 TOTAL_Q_HEADS = 64
 TOTAL_KV_HEADS = 4
 TOTAL_INDEX_HEADS = 4

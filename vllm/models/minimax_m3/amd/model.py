@@ -1568,8 +1568,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # decision is made here; the kernels themselves are built on the first step
         # they could serve, once the KV caches exist.
         self.mono = _mono_decode(self)
-        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
-            self.layers,
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
             MiniMaxM3MoE,
             enable_eplb=vllm_config.parallel_config.enable_eplb,
         )
