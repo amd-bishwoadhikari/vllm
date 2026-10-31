@@ -224,11 +224,13 @@ def pool_words(tokens: int) -> int:
     if not wide_moe(tokens):
         return HIDDEN // 2 * tokens
     rows = MOE_SLOTS * tokens + 1
+    # the split's 16-head MFMA tile (post_attn H_SUB) whatever the rank holds: a
+    # TP8 rank's 8 heads fill half of it. TP2 / TP4: the same values as before
     split_stage_words = (
-        WAVES * min(O_K, 16 * HEAD_DIM)
+        WAVES * 16 * HEAD_DIM
         + (16 * SPLIT_KEYS // 4)
-        + (min(O_K, 16 * HEAD_DIM) // 4)
-        + (3 * WAVES * min(LOCAL_Q_HEADS, 16))
+        + (16 * HEAD_DIM // 4)
+        + (3 * WAVES * 16)
         + 1024
     )
     return max(
