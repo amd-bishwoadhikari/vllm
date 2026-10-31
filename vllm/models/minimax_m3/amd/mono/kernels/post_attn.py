@@ -159,7 +159,10 @@ W13_ROWS = 2 * INTER  # gate rows then up rows (GGUU)
 W13_BYTES = W13_ROWS * HIDDEN // 2  # one expert, fp4
 W2_BYTES = HIDDEN * INTER // 2
 W13_SCALE_COLS = HIDDEN // 32
-W2_SCALE_COLS = INTER // 32
+# AITER's shuffle_scale pads the e8m0 scale columns to a multiple of 8 before it
+# views them in eights: INTER / 32 = 48 (TP2) and 24 (TP4) are unchanged, TP8's
+# 12 are stored as 16.
+W2_SCALE_COLS = -(-(INTER // 32) // 8) * 8
 S2_BYTES = (N_ROUTED + 1) * HIDDEN * W2_SCALE_COLS  # e8m0, every expert
 S13_BYTES = (N_ROUTED + 1) * W13_ROWS * W13_SCALE_COLS
 

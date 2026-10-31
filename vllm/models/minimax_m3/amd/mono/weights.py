@@ -272,7 +272,8 @@ class SparseMoeLayer:
         s2 = _attr(experts, "w2_weight_scale", f"layer {layer_id} experts")
         _need(
             s13.numel() == E * 2 * INTER * HIDDEN // 32
-            and s2.numel() == E * HIDDEN * INTER // 32,
+            # padded scale columns, see W2_SCALE_COLS in kernels/post_attn.py
+            and s2.numel() == E * HIDDEN * (-(-(INTER // 32) // 8) * 8),
             f"layer {layer_id}: expert scale counts {s13.numel()}/{s2.numel()}",
         )
 
