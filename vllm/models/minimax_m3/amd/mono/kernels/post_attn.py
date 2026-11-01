@@ -54,10 +54,12 @@ from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from vllm.models.minimax_m3.amd.mono.config import (
     BLOCKS,
+    DN_SKIP,
     HEAD_DIM,
     HIDDEN,
     INDEX_CP_FROM_BLOCKS,
     INTER,
+    K1_PREFETCH,
     LOCAL_KV_HEADS,
     MAX_INDEX_BLOCKS,
     MAX_SPARSE_KEYS,
@@ -69,6 +71,7 @@ from vllm.models.minimax_m3.amd.mono.config import (
     PAGE16_SIDES,
     SHARED_EXPERT,
     SPARSE_BLOCK,
+    SPLIT_SUB,
     THREADS,
     TOP_K,
     TOPK_BLOCKS,
@@ -137,6 +140,7 @@ from vllm.models.minimax_m3.amd.mono.layout import (
     SH_TASKS,
     SPARSE_TABLE_WORDS,
     SPLIT_KEYS,
+    SPLIT_PER,
     UG_PER_SLOT,
     UG_ROWS,
     XN8_ROW,
@@ -240,6 +244,7 @@ def build_post_attn_kernel(
     H_REAL = min(H, H_SUB)  # the real q heads of a subpass
     O_K_SUB = H_SUB * HEAD_DIM
     SUBPASSES = max(1, H // 16)
+    LOOP_SUB = SUBPASSES // SPLIT_PER  # subpasses one split task runs
     WORDS_PER_THREAD = (O_K // 4 + THREADS - 1) // THREADS
 
     OPART_WORDS = WAVES * O_K_SUB
@@ -292,6 +297,9 @@ def build_post_attn_kernel(
         ih=heads.count,
         io=heads.own,
         tl=timeline,
+        **({"pf": 1} if K1_PREFETCH else {}),
+        **({"ss": 1} if SPLIT_SUB else {}),
+        **({"dk": 1} if DN_SKIP else {}),
     )
 
     # the JIT cache key holds the kernel's scalar closure values, not objects: the
@@ -863,9 +871,10 @@ def build_post_attn_kernel(
             split stage (``select_long``), each leaving its blk for its split task
             (a CTA runs at most one). Out of the split stage and cold: inline
             there, this code slowed the split for every context (64k: +1 us)."""
-            ts = start("split")
+            tsk = start("split")
+            ts = tsk // SPLIT_PER if const_expr(SPLIT_PER > 1) else tsk
             k = ts // N_SPLIT
-            if unlikely((ts < N_SPLIT * tokens) & pick(long_rows, k)):
+            if unlikely((tsk < N_SPLIT * tokens * SPLIT_PER) & pick(long_rows, k)):
                 select_long(k, ts % N_SPLIT)
 
         # Each stage is its own function: flydsl carries a local reassigned inside a
@@ -880,8 +889,12 @@ def build_post_attn_kernel(
             qk_scale = sm_scale * ks
             pscale = vs * (1.0 / FP8_MAX)
             PPW = SPLIT_KEYS // WAVES // PAGE16  # pages per wave
-            for ts in range(start("split"), N_SPLIT * tokens, G):
-                ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
+            for tsk in range(start("split"), N_SPLIT * tokens * SPLIT_PER, G):
+                tsk = fx.Int32(tsk)
+                # token tok's partition t: ts = tok N_SPLIT + t; with SPLIT_SUB task
+                # tsk = ts SPLIT_PER + sub runs subpass sub of it
+                ts = tsk // SPLIT_PER if const_expr(SPLIT_PER > 1) else tsk
+                sub = tsk % SPLIT_PER if const_expr(SPLIT_PER > 1) else 0
                 tok = ts // N_SPLIT
                 t = ts % N_SPLIT
                 select_blocks(tok, t)
@@ -916,7 +929,8 @@ def build_post_attn_kernel(
                 key0 = t * SPLIT_KEYS + wave * (PPW * PAGE16)
                 valid = [key0 + j * PAGE16 + l16 < n_ctx for j in range(PPW)]
 
-                for subpass in range_constexpr(SUBPASSES):
+                for subpass_i in range_constexpr(LOOP_SUB):
+                    subpass = sub if const_expr(SPLIT_PER > 1) else subpass_i
                     h_offset = subpass * H_SUB
                     elem_offset = subpass * O_K_SUB
                     kv_head = subpass if const_expr(LOCAL_KV_HEADS > 1) else 0
@@ -2411,6 +2425,7 @@ def build_post_attn_kernel(
             # software pipeline: the first units' weights go out before the mids are
             # in; unit i + DN_DEPTH's before unit i's MFMA
             acc = [fx.Float32(0.0) for _ in range(4)]
+            a0, a1, a2, a3 = acc
             inflight = [unit_load(i) for i in range(min(DN_DEPTH, DN_WITERS))]
             # every up / gate task pair's flag, then the MXFP8 mid rows and their
             # scales, the pool's layout (plain words, 16 B a load)
@@ -2455,18 +2470,35 @@ def build_post_attn_kernel(
                 dwv, dsc, drow, dkc, dw, ok = inflight.pop(0)
                 if const_expr(i + DN_DEPTH < DN_WITERS):
                     inflight.append(with_rows(unit_load(i + DN_DEPTH)))
-                dcu = mfma_f4f8(
-                    dwv,
-                    dsc,
-                    lds_b8(drow * MID_ROW + dkc * 32),
-                    lds_i32(W_MIDSC + drow * MIDSC_ROW + dkc * 4 + g4),
-                    fx.Vector.filled(4, 0.0, fx.Float32),
-                )
-                # a unit past the last adds nothing, whatever its MFMA gave
-                acc = [
-                    acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0)) for e in range(4)
-                ]
-            a0, a1, a2, a3 = acc
+                if const_expr(DN_SKIP):
+                    # wave-uniform: a unit past the last reads no B, runs no MFMA
+                    if ok:
+                        dcu = mfma_f4f8(
+                            dwv,
+                            dsc,
+                            lds_b8(drow * MID_ROW + dkc * 32),
+                            lds_i32(W_MIDSC + drow * MIDSC_ROW + dkc * 4 + g4),
+                            fx.Vector.filled(4, 0.0, fx.Float32),
+                        )
+                        a0 = a0 + dcu[0] * dw
+                        a1 = a1 + dcu[1] * dw
+                        a2 = a2 + dcu[2] * dw
+                        a3 = a3 + dcu[3] * dw
+                else:
+                    dcu = mfma_f4f8(
+                        dwv,
+                        dsc,
+                        lds_b8(drow * MID_ROW + dkc * 32),
+                        lds_i32(W_MIDSC + drow * MIDSC_ROW + dkc * 4 + g4),
+                        fx.Vector.filled(4, 0.0, fx.Float32),
+                    )
+                    # a unit past the last adds nothing, whatever its MFMA gave
+                    acc = [
+                        acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0))
+                        for e in range(4)
+                    ]
+            if const_expr(not DN_SKIP):
+                a0, a1, a2, a3 = acc
             fx.ptr_store(
                 fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32),
                 red + (wave * 64 + lane) * 4,

@@ -48,6 +48,19 @@ LOCAL_Q_HEADS = TOTAL_Q_HEADS // TP
 LOCAL_KV_HEADS = max(1, TOTAL_KV_HEADS // TP)
 LOCAL_INDEX_HEADS = max(1, TOTAL_INDEX_HEADS // TP)
 
+# Kernel variants, off unless switched on (measured at TP2):
+# VLLM_MONO_K1_PREFETCH: K1's GEMV CTAs issue every folded task's weights before the
+# x8 poll, not each task's after the poll and the previous task's GEMV.
+# VLLM_MONO_SPLIT_SUB: each 16-head subpass of a split partition is its own task (a
+# rank with more than 16 q heads, i.e. TP2, runs them on separate CTAs, not one
+# after another).
+# VLLM_MONO_DN_SKIP: the wide MoE down loop skips the B reads and MFMA of units past
+# the step's last distinct expert (wave-uniform branch) instead of masking their
+# result.
+K1_PREFETCH = os.environ.get("VLLM_MONO_K1_PREFETCH", "0") == "1"
+SPLIT_SUB = os.environ.get("VLLM_MONO_SPLIT_SUB", "0") == "1" and LOCAL_Q_HEADS > 16
+DN_SKIP = os.environ.get("VLLM_MONO_DN_SKIP", "0") == "1"
+
 
 def qkv_rows(idx_heads: int) -> int:
     """Rows of a rank's fused projection, q | k | v | index_q | index_k:

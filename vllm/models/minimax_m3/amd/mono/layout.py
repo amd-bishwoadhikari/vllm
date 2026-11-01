@@ -20,6 +20,7 @@ from vllm.models.minimax_m3.amd.mono.config import (
     N_ROUTED,
     PAGE16,
     SPARSE_BLOCK,
+    SPLIT_SUB,
     TOP_K,
     TOPK_BLOCKS,
     TP,
@@ -29,6 +30,8 @@ from vllm.models.minimax_m3.amd.mono.config import (
 H = LOCAL_Q_HEADS
 SPLIT_KEYS = 256  # one gluon context partition per split task
 N_SPLIT = MAX_SPARSE_KEYS // SPLIT_KEYS
+# split tasks per (token, partition): one, or one per 16-head subpass (SPLIT_SUB)
+SPLIT_PER = H // 16 if SPLIT_SUB else 1
 O_K = H * HEAD_DIM
 O_ROWS = 32  # hidden rows per o_proj / attention-reduce task
 # from this many tokens the attention all-reduce is a reduce-scatter to the row
@@ -131,17 +134,18 @@ def sym_layout(npes: int):
 def stage_bases(tokens: int):
     """Task t of a stage runs on CTA (base + t) % BLOCKS; the merge (S > 1), o and
     down tasks start past the tokens' split CTAs."""
-    n_split = N_SPLIT * tokens
+    n_split = N_SPLIT * tokens * SPLIT_PER
     n_merge = tokens if tokens > 1 else 0
     router = (n_split + n_merge + N_O) % BLOCKS
     return {
         "split": 0,
-        "merge": n_split,
-        "o": n_split + n_merge,
+        # modulo BLOCKS: with SPLIT_SUB, S = 16 has BLOCKS split tasks
+        "merge": n_split % BLOCKS,
+        "o": (n_split + n_merge) % BLOCKS,
         "router": router,
         "shared": _shared_base(tokens, router),
         "ug": 0,
-        "down": n_split,
+        "down": n_split % BLOCKS,
     }
 
 
@@ -169,7 +173,7 @@ def _shared_base(tokens: int, router: int) -> int:
     routed tasks: S = 4, 4 us); then by its down CTAs (S = 2: 43.1 vs 43.7 us);
     then by its router CTAs anyway."""
     n_router = N_ROUTER * tokens
-    n_split = N_SPLIT * tokens
+    n_split = N_SPLIT * tokens * SPLIT_PER % BLOCKS  # the down base
     most = max(ug_tasks_of(c, tokens) for c in range(BLOCKS))
 
     def cost(base):
