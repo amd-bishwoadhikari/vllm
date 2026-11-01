@@ -20,7 +20,25 @@ HIDDEN = 6144
 HEAD_DIM = 128
 ROTARY_DIM = 64
 
-TP = int(os.environ.get("VLLM_MONO_TP", "2"))
+
+def _serving_tp() -> int:
+    """VLLM_MONO_TP when set, else the TP of the engine being built.
+
+    This module is first imported while the model is built, inside the engine's
+    config context, so the TP read here is the one being served; one build then
+    serves TP2, TP4 and TP8. Outside a config context (e.g. a standalone kernel
+    test) it falls back to 2.
+    """
+    env = os.environ.get("VLLM_MONO_TP")
+    if env:
+        return int(env)
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    return config.parallel_config.tensor_parallel_size if config else 2
+
+
+TP = _serving_tp()
 TOTAL_Q_HEADS = 64
 TOTAL_KV_HEADS = 4
 TOTAL_INDEX_HEADS = 4
@@ -29,6 +47,19 @@ TOTAL_INTER = 3072
 LOCAL_Q_HEADS = TOTAL_Q_HEADS // TP
 LOCAL_KV_HEADS = max(1, TOTAL_KV_HEADS // TP)
 LOCAL_INDEX_HEADS = max(1, TOTAL_INDEX_HEADS // TP)
+
+# Kernel variants, off unless switched on (measured at TP2):
+# VLLM_MONO_K1_PREFETCH: K1's GEMV CTAs issue every folded task's weights before the
+# x8 poll, not each task's after the poll and the previous task's GEMV.
+# VLLM_MONO_SPLIT_SUB: each 16-head subpass of a split partition is its own task (a
+# rank with more than 16 q heads, i.e. TP2, runs them on separate CTAs, not one
+# after another).
+# VLLM_MONO_DN_SKIP: the wide MoE down loop skips the B reads and MFMA of units past
+# the step's last distinct expert (wave-uniform branch) instead of masking their
+# result.
+K1_PREFETCH = os.environ.get("VLLM_MONO_K1_PREFETCH", "0") == "1"
+SPLIT_SUB = os.environ.get("VLLM_MONO_SPLIT_SUB", "0") == "1" and LOCAL_Q_HEADS > 16
+DN_SKIP = os.environ.get("VLLM_MONO_DN_SKIP", "0") == "1"
 
 
 def qkv_rows(idx_heads: int) -> int:

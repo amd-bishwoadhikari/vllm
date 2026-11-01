@@ -32,6 +32,7 @@ from vllm.models.minimax_m3.amd.mono.config import (
     BLOCKS,
     HEAD_DIM,
     HIDDEN,
+    K1_PREFETCH,
     LOCAL_KV_HEADS,
     LOCAL_Q_HEADS,
     MAX_QKV_ROWS,
@@ -393,6 +394,54 @@ def emit_pre_attn(
         rocdl.sched_barrier(0)
         r_w = rsrc(w_qkv)
 
+        def load_row_group(curr_rg):
+            """Row group curr_rg's weights (64-k chunk kc is 1 KB at ((rg*K/32 +
+            2kc)*512); lane l holds row l%16, k = 64kc + 16(l/16) + [0, 16)) and the
+            scale of row tid % 16."""
+            wts = []
+            for c in range_constexpr(CHUNKS_PER_WAVE):
+                kc = wave * CHUNKS_PER_WAVE + c
+                wts.append(
+                    fx.Vector(
+                        bo.buffer_load(
+                            r_w,
+                            ((curr_rg * (HIDDEN // 32) + kc * 2) * 512 + lane * 16)
+                            // 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                        )
+                    )
+                )
+            ws = fx.Float32(  # row tid % 16's scale, sampled below by tid < 16 tokens
+                bo.buffer_load(
+                    rsrc(s_qkv),
+                    curr_rg * ROWS_PER_TASK + tid % ROWS_PER_TASK,
+                    vec_width=1,
+                    dtype=T.f32,
+                )
+            )
+            return wts, ws
+
+        if const_expr(K1_PREFETCH):
+            # This CTA's row groups (a primary CTA's TASKS_PER_CTA, an other-head
+            # CTA's one), every one's weights in flight before the x rows are in:
+            # issued inside each task they waited out the x8 poll (the norm tasks)
+            # and, with task folding (TP2), the previous task's GEMV. The poll's
+            # first round then waits for the weights too (vmcnt is in order), which
+            # the GEMV needs before it starts anyway.
+            gemv_rgs = []
+            gemv_ok = []
+            for step_i in range_constexpr(TASKS_PER_CTA):
+                task_id = bid * TASKS_PER_CTA + step_i
+                ok = is_primary_gemv & (task_id < ONE_GEMV)
+                rg = get_rg(fx.min(task_id, ONE_GEMV - 1))
+                if const_expr(heads.count > 1 and step_i == 0):
+                    rg = is_other_gemv.select(other_rg, rg)
+                    ok = ok | is_other_gemv
+                gemv_rgs.append(rg)
+                gemv_ok.append(ok)
+            gemv_w = [load_row_group(rg) for rg in gemv_rgs]
+
         if const_expr(tokens <= 2):
             x_scales = norm_quant(
                 list(range(tokens)), raw_g, raw_ar, lambda j: bid == j
@@ -429,31 +478,8 @@ def emit_pre_attn(
 
         col_tok = fx.min(lane % 16, tokens - 1)
 
-        def run_gemv_row_group(curr_rg):
-            # 64-k chunk kc of row group rg is 1 KB at ((rg*K/32 + 2kc)*512); lane l
-            # holds row l%16, k = 64kc + 16(l/16) + [0, 16).
-            wts = []
-            for c in range_constexpr(CHUNKS_PER_WAVE):
-                kc = wave * CHUNKS_PER_WAVE + c
-                wts.append(
-                    fx.Vector(
-                        bo.buffer_load(
-                            r_w,
-                            ((curr_rg * (HIDDEN // 32) + kc * 2) * 512 + lane * 16)
-                            // 4,
-                            vec_width=4,
-                            dtype=T.i32,
-                        )
-                    )
-                )
-            ws = fx.Float32(  # row tid % 16's scale, sampled below by tid < 16 tokens
-                bo.buffer_load(
-                    rsrc(s_qkv),
-                    curr_rg * ROWS_PER_TASK + tid % ROWS_PER_TASK,
-                    vec_width=1,
-                    dtype=T.f32,
-                )
-            )
+        def run_gemv_row_group(curr_rg, loaded):
+            wts, ws = loaded
             c = fx.Vector.filled(4, 0.0, fx.Float32)
             for cc in range_constexpr(CHUNKS_PER_WAVE):
                 kc = wave * CHUNKS_PER_WAVE + cc
@@ -491,14 +517,20 @@ def emit_pre_attn(
                 )
             gpu.barrier()
 
-        if is_primary_gemv:
+        if const_expr(K1_PREFETCH):
             for step_i in range_constexpr(TASKS_PER_CTA):
-                task_id = bid * TASKS_PER_CTA + step_i
-                if task_id < ONE_GEMV:
-                    run_gemv_row_group(get_rg(task_id))
-        if const_expr(heads.count > 1):
-            if is_other_gemv:
-                run_gemv_row_group(other_rg)
+                if gemv_ok[step_i]:
+                    run_gemv_row_group(gemv_rgs[step_i], gemv_w[step_i])
+        else:
+            if is_primary_gemv:
+                for step_i in range_constexpr(TASKS_PER_CTA):
+                    task_id = bid * TASKS_PER_CTA + step_i
+                    if task_id < ONE_GEMV:
+                        rg = get_rg(task_id)
+                        run_gemv_row_group(rg, load_row_group(rg))
+            if const_expr(heads.count > 1):  # noqa: SIM102
+                if is_other_gemv:
+                    run_gemv_row_group(other_rg, load_row_group(other_rg))
 
         stamp(3)
 
@@ -762,6 +794,7 @@ def build_pre_attn_kernel(
         ih=heads.count,
         io=heads.own,
         tl=timeline,
+        **({"pf": 1} if K1_PREFETCH else {}),
     )
 
     # the JIT cache key holds the kernel's scalar closure values, not objects: the
